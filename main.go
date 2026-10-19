@@ -43,6 +43,9 @@ static void store_host_api(const cliproxy_host_api* host) {
 import "C"
 
 import (
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"strings"
 	"unicode"
@@ -69,12 +72,35 @@ const (
 	maxRequestPayloadBytes = 64 << 20
 	maxSessionIDBytes      = 1024
 
-	targetSessionHeader = "X-Opencode-Session"
-	targetClientHeader  = "X-Opencode-Client"
-	defaultClientValue  = "cliproxy"
+	targetSessionHeader   = "X-Opencode-Session"
+	targetSessionIDHeader = "X-Opencode-Session-Id"
+	targetRequestHeader   = "X-Opencode-Request"
+	targetClientHeader    = "X-Opencode-Client"
+	targetProjectHeader   = "X-Opencode-Project"
+
+	// Wire fingerprint of the official OpenCode CLI (free-tier snapshot,
+	// 2026-10-19). Upstream rejects free-tier requests whose custom headers
+	// do not look like the official client (403 FreeTierError):
+	//   - x-opencode-client: "cli" (a proxy self-label such as "cliproxy"
+	//     no longer passes)
+	//   - x-opencode-project: "global"
+	//   - x-opencode-request: "msg_" + 12 hex + 14 base62, varied per request
+	//   - x-opencode-session / x-opencode-session-id: a REAL session the
+	//     official CLI minted (fabricated ids are rejected outright)
+	// The plugin injects these (never overriding client-provided ones); the
+	// User-Agent must be pinned per zen credential in config.yml.
+	defaultClientValue  = "cli"
+	defaultProjectValue = "global"
+
+	requestIDPrefix   = "msg_"
+	requestIDHexLen   = 12
+	requestIDAlphaLen = 14
+
+	hexDigits   = "0123456789abcdef"
+	alphaDigits = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
 )
 
-var pluginVersion = "0.3.2"
+var pluginVersion = "0.4.0"
 
 // sessionSources lists downstream client headers that carry a stable
 // per-conversation session id, in priority order. The first non-empty
@@ -229,7 +255,7 @@ func handleMethod(method string, payload []byte) ([]byte, error) {
 				Name:             pluginID,
 				Version:          pluginVersion,
 				Author:           "ahoo",
-				GitHubRepository: "https://github.com/ahoo/cpa-plugin-opencode-session-mapper",
+				GitHubRepository: "https://github.com/Lynn-Becky/cpa-plugin-opencode",
 				Logo:             "",
 				ConfigFields:     []any{},
 			},
@@ -246,11 +272,21 @@ func requestPayloadSizeAllowed(size uint64) bool {
 	return size <= maxRequestPayloadBytes
 }
 
-// headerValue returns a normalized session identifier and whether the header
-// name was present. Empty values, invalid values, or conflicting repeated /
-// case-variant values are reported as present with an empty value so callers
-// can fail closed instead of selecting a value using randomized map order.
-func headerValue(headers map[string][]string, name string) (string, bool) {
+// Header lookup outcomes. headerConflict marks a header that matched but
+// whose values are unusable (empty list, control characters, oversized, or
+// conflicting repeated / case-variant values); callers fail closed instead
+// of selecting a value using randomized map iteration order.
+const (
+	headerOK = iota
+	headerAbsent
+	headerConflict
+)
+
+// lookupHeader matches name case-insensitively and returns the first value
+// with ok == headerOK when every matched value normalizes to the same
+// identifier. Empty lists, invalid values, or conflicting values are reported
+// as headerConflict with an empty value.
+func lookupHeader(headers map[string][]string, name string) (string, int) {
 	matched := false
 	selected := ""
 	for key, values := range headers {
@@ -259,26 +295,40 @@ func headerValue(headers map[string][]string, name string) (string, bool) {
 		}
 		matched = true
 		if len(values) == 0 {
-			return "", true
+			return "", headerConflict
 		}
 		for _, raw := range values {
 			value, valid := normalizeSessionID(raw)
 			if !valid {
-				return "", true
+				return "", headerConflict
 			}
 			if selected == "" {
 				selected = value
 				continue
 			}
 			if selected != value {
-				return "", true
+				return "", headerConflict
 			}
 		}
 	}
 	if !matched {
-		return "", false
+		return "", headerAbsent
 	}
-	return selected, true
+	return selected, headerOK
+}
+
+// headerValue keeps the historical (value, present) shape used when scanning
+// downstream session source headers: a present-but-conflicting header counts
+// as present with an empty value so callers can fail closed.
+func headerValue(headers map[string][]string, name string) (string, bool) {
+	value, status := lookupHeader(headers, name)
+	if status == headerOK {
+		return value, true
+	}
+	if status == headerConflict {
+		return "", true
+	}
+	return "", false
 }
 
 func headerHasValue(headers map[string][]string, name string) bool {
@@ -322,33 +372,121 @@ func interceptHeaders(payload []byte) ([]byte, error) {
 	if req.Headers == nil {
 		return empty, nil
 	}
-	// Client already sent x-opencode-session (e.g. real opencode CLI):
-	// never override, their value is authoritative.
-	if _, exists := headerValue(req.Headers, targetSessionHeader); exists {
+
+	// Session resolution (unchanged rules): a client-sent x-opencode-session
+	// (e.g. real opencode CLI) is authoritative and never overridden.
+	value, status := lookupHeader(req.Headers, targetSessionHeader)
+	if status == headerConflict {
 		return empty, nil
 	}
-	var session string
-	for _, src := range sessionSources {
-		if v, exists := headerValue(req.Headers, src); exists {
-			if v == "" {
-				return empty, nil
+	session := value
+	if session == "" {
+		for _, src := range sessionSources {
+			if v, exists := headerValue(req.Headers, src); exists {
+				if v == "" {
+					return empty, nil
+				}
+				session = v
+				break
 			}
-			session = v
-			break
+		}
+		if session == "" {
+			session = sessionFallback(req.Metadata)
 		}
 	}
 	if session == "" {
-		session = sessionFallback(req.Metadata)
-	}
-	if session == "" {
 		return empty, nil
 	}
-	out := map[string][]string{targetSessionHeader: {session}}
-	// Identify the proxy only when the client didn't identify itself.
+
+	out := map[string][]string{}
+
+	// Map the stable conversation identity, plus the session-id mirror the
+	// official CLI sends alongside it. A client-supplied value is echoed
+	// unchanged (normalized), never replaced.
+	if value == "" {
+		out[targetSessionHeader] = []string{session}
+	}
+	if mirror, mirrorStatus := lookupHeader(req.Headers, targetSessionIDHeader); mirrorStatus == headerConflict {
+		return empty, nil
+	} else if mirrorStatus == headerAbsent {
+		out[targetSessionIDHeader] = []string{session}
+	} else {
+		out[targetSessionIDHeader] = []string{mirror}
+	}
+
+	// Per-request id, matching the official CLI format
+	// ("msg_" + 12 hex + 14 base62). Derived from the host request id so
+	// both interceptor passes agree on one value; generated when the host
+	// provides none. Client-supplied values pass through unchanged.
+	// Echoing supplies the value to the `$` header forwarding config;
+	// generation failures omit the header: a stale value would fail the
+	// free-tier fingerprint.
+	if requestID, requestIDStatus := lookupHeader(req.Headers, targetRequestHeader); requestIDStatus == headerConflict {
+		return empty, nil
+	} else if requestIDStatus == headerAbsent {
+		if generated, errRequestID := regenerateRequestID(req.RequestID); errRequestID == nil {
+			out[targetRequestHeader] = []string{generated}
+		}
+	} else {
+		out[targetRequestHeader] = []string{requestID}
+	}
+
+	// Identify the client as the official CLI when it did not identify itself.
 	if !headerHasValue(req.Headers, targetClientHeader) {
 		out[targetClientHeader] = []string{defaultClientValue}
 	}
+
+	// Official CLI project scope; a client-supplied value passes through.
+	if project, projectStatus := lookupHeader(req.Headers, targetProjectHeader); projectStatus == headerConflict {
+		return empty, nil
+	} else if projectStatus == headerAbsent {
+		out[targetProjectHeader] = []string{defaultProjectValue}
+	} else {
+		out[targetProjectHeader] = []string{project}
+	}
+
+	if len(out) == 0 {
+		return empty, nil
+	}
 	return okEnvelopeJSON(interceptResponse{Headers: out})
+}
+
+// regenerateRequestID produces one x-opencode-request value per request:
+// "msg_" + 12 hex + 14 base62 (official CLI wire format). When the host
+// envelope carries a RequestID the value is derived from it, keeping the
+// before-auth and after-auth interceptor passes consistent; otherwise it is
+// generated fresh via crypto/rand. A fixed value across requests would fail
+// the free-tier fingerprint check.
+func regenerateRequestID(envelopeRequestID string) (string, error) {
+	if envelopeRequestID == "" {
+		return randomRequestID()
+	}
+	digest := sha256.Sum256([]byte(envelopeRequestID))
+	var builder strings.Builder
+	builder.Grow(len(requestIDPrefix) + requestIDHexLen + requestIDAlphaLen)
+	builder.WriteString(requestIDPrefix)
+	builder.WriteString(hex.EncodeToString(digest[:requestIDHexLen/2]))
+	for _, byteValue := range digest[requestIDHexLen/2 : requestIDHexLen/2+requestIDAlphaLen] {
+		builder.WriteByte(alphaDigits[int(byteValue)%62])
+	}
+	return builder.String(), nil
+}
+
+func randomRequestID() (string, error) {
+	buf := make([]byte, requestIDHexLen+requestIDAlphaLen)
+	if _, err := rand.Read(buf); err != nil {
+		return "", err
+	}
+	var builder strings.Builder
+	builder.Grow(len(requestIDPrefix) + len(buf))
+	builder.WriteString(requestIDPrefix)
+	for _, byteValue := range buf[:requestIDHexLen] {
+		builder.WriteByte(hexDigits[int(byteValue)%len(hexDigits)])
+	}
+	for _, byteValue := range buf[requestIDHexLen:] {
+		builder.WriteByte(alphaDigits[int(byteValue)%len(alphaDigits)])
+	}
+	return builder.String(), nil
 }
 
 // sessionFallback returns the host-computed conversation identity for clients

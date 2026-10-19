@@ -1,7 +1,23 @@
 # cpa-plugin-opencode-session-mapper
 
 CLIProxyAPI request interceptor plugin: forwards client conversation session
-ids to OpenCode Zen as `x-opencode-session`.
+ids to OpenCode Zen as `x-opencode-session`, and since v0.4.0 completes the
+free-tier client fingerprint upstream expects:
+`x-opencode-client: cli`, `x-opencode-project: global`, a per-request
+`x-opencode-request`, and the `x-opencode-session-id` session mirror.
+
+Since 09/06 OpenCode Zen free tier rejects requests that do not look like the
+official CLI with `403 FreeTierError`: custom headers (`x-opencode-client`
+must be `cli`, not a proxy label), a real CLI-minted session
+(`x-opencode-session`/`x-opencode-session-id`), and a request id shaped
+`msg_` + 12 hex + 14 base62 that varies per request. Fabricated session ids
+are rejected outright — sessions must be minted by running the real CLI once
+and captured from its wire request (rotate/mint fresh ones regularly; a 403
+means a stale session, while a 429 is pure per-IP rate limiting).
+
+Exact wire snapshot captured 2026-10-19 from CLI 1.19.0
+(`ai-sdk/provider-utils/4.0.23`, `bun/1.3.14`) — pin the matching
+`User-Agent` per credential in `config.yaml` (see Install).
 
 OpenCode Zen uses `x-opencode-session` (one stable ID per conversation) for
 sticky routing and prompt-cache affinity. Since 09/06, requests missing this
@@ -10,15 +26,18 @@ executors rebuild outbound headers from scratch and only forward a small
 whitelist (`Version` / `Session_id` / `User-Agent` on the codex path, nothing
 extra on the openai-compat path).
 
-This plugin restores the session signal in two stages:
+This plugin restores the session signal and the fingerprint in two stages:
 
 1. **Plugin** (`request.intercept_before` + `request.intercept_after`):
    reads the downstream client's own stable session headers and injects them
-   as `X-Opencode-Session` into the execution headers, plus
-   `X-Opencode-Client: cliproxy` when the client didn't identify itself.
+   as `X-Opencode-Session` into the execution headers, plus the
+   `X-Opencode-Session-Id` mirror, a per-request `X-Opencode-Request`
+   (`msg_` + 12 hex + 14 base62, derived from the host request id so both
+   interceptor passes agree — generated fresh when the host provides none),
+   `X-Opencode-Client: cli`, and `X-Opencode-Project: global`.
 2. **Config** (`headers:` with `$` references on each zen credential):
    resolves the injected values onto the actual upstream wire request via
-   `X-Opencode-Session: $X-Opencode-Session`.
+   `X-Opencode-Session: $X-Opencode-Session` and friends.
 
 Session source priority (the first present, valid source wins):
 
@@ -36,6 +55,10 @@ Rules:
 
 - A client-sent `x-opencode-session` (real opencode CLI) is authoritative and
   never overridden.
+- Client-supplied `x-opencode-session-id` / `x-opencode-request` /
+  `x-opencode-project` / `x-opencode-client` values pass through unchanged
+  (with the bare `X-Opencode-Session` re-injected only when the client didn't
+  send it); official CLI values are substituted for anything missing.
 - A client-supplied header always outranks the metadata fallback below; a
   request that identifies itself is never overridden.
 - No header at all → the **metadata fallback** below, then no-op.
@@ -44,8 +67,7 @@ Rules:
   case-variant values fail closed instead of depending on Go map iteration
   order. A present but invalid higher-priority source also blocks lower
   sources and the metadata fallback rather than allowing header poisoning.
-- A blank `X-Opencode-Client` does not count as client identification, so the
-  plugin supplies the default `cliproxy` value.
+  The same fail-closed treatment applies to the fingerprint headers above.
 - Serialized native interceptor envelopes larger than 64 MiB (fixed,
   non-configurable cap) are rejected before any pointer dereference, before
   any allocation, and before the C `size_t` -> `C.int` conversion feeding
@@ -89,6 +111,12 @@ Verified live against zen:
   `MissingSessionID` 400; the derived id stays stable as a conversation grows
   turn by turn and differs between conversations.
 
+v0.4.0 fingerprint values (`cli` / `global` / `msg_…` request ids) follow the
+2026-10-19 CLI 1.19.0 wire snapshot from the free-tier analysis notes; live
+zen re-verification of that fingerprint is pending, and the snapshot may rot
+as the CLI updates — re-capture the wire request when upstream changes its
+client and `403` starts reappearing.
+
 ## Capability
 
 - `request_interceptor` — runs before and after credential selection.
@@ -101,7 +129,7 @@ Add the store source and enable the plugin in `config.yaml`:
 plugins:
   enabled: true
   store-sources:
-    - https://raw.githubusercontent.com/ahoo/cpa-plugin-opencode-session-mapper/main/registry.json
+    - https://raw.githubusercontent.com/Lynn-Becky/cpa-plugin-opencode/main/registry.json
   configs:
     opencode-session-mapper:
       enabled: true
@@ -109,18 +137,27 @@ plugins:
 ```
 
 Then add `$` forwarding headers to every zen credential so the injected
-values reach the wire. On each `codex-api-key` entry whose `base-url`
-contains `opencode.ai`, and on the `openai-compatibility` provider pointing
-at `https://opencode.ai/zen/v1`:
+values reach the wire, and pin the captured CLI `User-Agent` fingerprint. On
+each `codex-api-key` entry whose `base-url` contains `opencode.ai`, and on
+the `openai-compatibility` provider pointing at `https://opencode.ai/zen/v1`:
 
 ```yaml
 headers:
   X-Opencode-Session: $X-Opencode-Session
+  X-Opencode-Session-Id: $X-Opencode-Session-Id
+  X-Opencode-Request: $X-Opencode-Request
   X-Opencode-Client: $X-Opencode-Client
+  X-Opencode-Project: $X-Opencode-Project
+  User-Agent: opencode/1.19.0 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14
 ```
 
 `$Name` copies the value from the (plugin-augmented) execution headers; when
-absent the header is omitted. Restart CLIProxyAPI (plugins load at startup):
+absent the header is omitted. When a new CLI pins its fingerprint (a fresh
+wire snapshot), update both the `User-Agent` here and any captured values.
+
+Sessions must be real CLI-minted exchange ids (`ses_...` captured from the
+official CLI's actual requests); fabricated ids fail with 403 regardless of
+the rest of the fingerprint. Restart CLIProxyAPI (plugins load at startup):
 
 ```bash
 docker restart cli-proxy-api
@@ -149,7 +186,7 @@ Use it from a clean Git checkout:
 # Override only when an explicit staging directory is desired:
 PLUGIN_OUT_DIR=/tmp/opencode-session-mapper-build ./build.sh
 # Release automation may also inject another prerelease/test identity:
-PLUGIN_VERSION=0.3.2-dev PLUGIN_OUT_DIR=/tmp/opencode-session-mapper-build ./build.sh
+PLUGIN_VERSION=0.4.0-dev PLUGIN_OUT_DIR=/tmp/opencode-session-mapper-build ./build.sh
 ```
 
 ## Test
@@ -182,6 +219,16 @@ packaging. Published tags and assets are never replaced.
 (base64-encoded) bodies are accepted into normal header/metadata mapping;
 mapping behavior is otherwise unchanged. Published tags and assets are never
 replaced.
+
+`v0.4.0` completes the free-tier client fingerprint per the 2026-10-19 wire
+snapshot: default `X-Opencode-Client` is now `cli` (was `cliproxy`),
+`X-Opencode-Project: global` is injected, `X-Opencode-Request` carries a
+per-request `msg_` + 12 hex + 14 base62 id derived from the host request id
+(random when the host supplies none), and `X-Opencode-Session-Id` mirrors the
+mapped session. Client-supplied values for these headers pass through
+unchanged; conflicting case-variant pairs fail closed. Credential configs
+must add the new `$` forwarding headers and pin `User-Agent`. Published tags
+and assets are never replaced.
 
 ## License
 

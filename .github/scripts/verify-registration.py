@@ -10,14 +10,17 @@ import argparse
 import base64
 import ctypes
 import json
+import re
 from pathlib import Path
 
 PLUGIN_ID = "opencode-session-mapper"
-REPOSITORY = "https://github.com/ahoo/cpa-plugin-opencode-session-mapper"
+REPOSITORY = "https://github.com/Lynn-Becky/cpa-plugin-opencode"
 MAX_REQUEST_PAYLOAD = 64 << 20
 LARGE_BODY_BYTES = 6_378_698
 SIZE_MAX = (1 << (8 * ctypes.sizeof(ctypes.c_size_t))) - 1
 SESSION_FIXTURE = "123e4567-e89b-12d3-a456-426614174000"
+# Official CLI free-tier wire fingerprint: msg_ + 12 hex + 14 base62.
+REQUEST_ID_PATTERN = re.compile(r"^msg_[0-9a-f]{12}[A-Za-z0-9]{14}$")
 
 
 class Buffer(ctypes.Structure):
@@ -107,8 +110,21 @@ def require_mapping(label: str, status: int, envelope) -> None:
     if not isinstance(headers, dict):
         raise SystemExit(f"{label} mapping failed: result_shape=false")
     session = headers.get("X-Opencode-Session")
+    session_id = headers.get("X-Opencode-Session-Id")
     client = headers.get("X-Opencode-Client")
-    if session != [SESSION_FIXTURE] or client != ["cliproxy"]:
+    project = headers.get("X-Opencode-Project")
+    request = headers.get("X-Opencode-Request")
+    exact = (
+        session == [SESSION_FIXTURE]
+        and session_id == [SESSION_FIXTURE]
+        and client == ["cli"]
+        and project == ["global"]
+        and isinstance(request, list)
+        and len(request) == 1
+        and isinstance(request[0], str)
+        and REQUEST_ID_PATTERN.fullmatch(request[0]) is not None
+    )
+    if not exact:
         raise SystemExit(f"{label} mapping failed: headers_exact=false")
 
 
@@ -238,7 +254,8 @@ def main() -> None:
 
     print(
         f"verified {PLUGIN_ID} registration {args.version}, ABI init/free guards, "
-        f"both interceptor methods, large-envelope mapping, and {MAX_REQUEST_PAYLOAD}-byte cap"
+        "both interceptor methods, large-envelope mapping, free-tier fingerprint "
+        f"headers, and {MAX_REQUEST_PAYLOAD}-byte cap"
     )
 
 

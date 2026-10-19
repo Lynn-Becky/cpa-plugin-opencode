@@ -16,7 +16,7 @@ import zipfile
 from pathlib import Path
 
 PLUGIN_ID = "opencode-session-mapper"
-REPOSITORY = "https://github.com/ahoo/cpa-plugin-opencode-session-mapper"
+REPOSITORY = "https://github.com/Lynn-Becky/cpa-plugin-opencode"
 ABI_VERSION = 1
 EXPECTED_TARGETS = (
     ("linux", "amd64", "so"),
@@ -49,7 +49,10 @@ REQUIRED_ASSERTIONS = frozenset(
     (
         "large_envelope_forwarded",
         "session_header_mapped",
+        "session_id_header_mapped",
+        "request_header_formatted",
         "client_header_mapped",
+        "project_header_mapped",
         "mock_request_count_one",
         "interceptor_errors_zero",
         "recovered_panics_zero",

@@ -23,7 +23,10 @@ EPOCH = (1980, 1, 1, 0, 0, 0)
 REQUIRED_ASSERTIONS = (
     "large_envelope_forwarded",
     "session_header_mapped",
+    "session_id_header_mapped",
+    "request_header_formatted",
     "client_header_mapped",
+    "project_header_mapped",
     "mock_request_count_one",
     "interceptor_errors_zero",
     "recovered_panics_zero",

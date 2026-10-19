@@ -2,9 +2,13 @@ package main
 
 import (
 	"encoding/json"
+	"regexp"
 	"strings"
 	"testing"
 )
+
+// Official CLI wire format: "msg_" + 12 lowercase hex + 14 alphanumeric.
+var requestIDPattern = regexp.MustCompile(`^msg_[0-9a-f]{12}[A-Za-z0-9]{14}$`)
 
 func mustIntercept(t *testing.T, headers map[string][]string) interceptResponse {
 	t.Helper()
@@ -42,14 +46,39 @@ func TestNilHeadersNoop(t *testing.T) {
 	}
 }
 
+// The official CLI wire fingerprint is regex-shaped: msg_ + 12 hex + 14
+// alphanumeric. Many assertions below check it.
+func mustMatchingRequestID(t *testing.T, headers map[string][]string) string {
+	t.Helper()
+	values := headers["X-Opencode-Request"]
+	if len(values) != 1 {
+		t.Fatalf("X-Opencode-Request = %v, want exactly one value", values)
+	}
+	id := values[0]
+	if !requestIDPattern.MatchString(id) {
+		t.Fatalf("request id %q does not match the official format", id)
+	}
+	return id
+}
+
 func TestExistingOpencodeSessionPreserved(t *testing.T) {
 	resp := mustIntercept(t, map[string][]string{
 		"x-opencode-session": {"ses_client"},
 		"Session-Id":         {"should-not-win"},
 	})
-	if len(resp.Headers) != 0 {
-		t.Fatalf("headers = %v, want empty (client value authoritative)", resp.Headers)
+	if _, ok := resp.Headers["X-Opencode-Session"]; ok {
+		t.Fatalf("headers = %v, want the client value untouched", resp.Headers)
 	}
+	if got := resp.Headers["X-Opencode-Session-Id"]; len(got) != 1 || got[0] != "ses_client" {
+		t.Fatalf("session-id mirror = %v, want ses_client", resp.Headers)
+	}
+	if got := resp.Headers["X-Opencode-Client"]; len(got) != 1 || got[0] != defaultClientValue {
+		t.Fatalf("headers = %v, want the cli fingerprint", resp.Headers)
+	}
+	if got := resp.Headers["X-Opencode-Project"]; len(got) != 1 || got[0] != defaultProjectValue {
+		t.Fatalf("headers = %v, want the cli project scope", resp.Headers)
+	}
+	mustMatchingRequestID(t, resp.Headers)
 }
 
 func TestConflictingCaseVariantSessionHeadersFailClosed(t *testing.T) {
@@ -101,9 +130,16 @@ func TestCodexSessionMapped(t *testing.T) {
 	if len(got) != 1 || got[0] != "codex-ses-1" {
 		t.Fatalf("headers = %v, want x-opencode-session=codex-ses-1", resp.Headers)
 	}
-	if got := resp.Headers["X-Opencode-Client"]; len(got) != 1 || got[0] != "cliproxy" {
-		t.Fatalf("headers = %v, want x-opencode-client=cliproxy", resp.Headers)
+	if got := resp.Headers["X-Opencode-Client"]; len(got) != 1 || got[0] != defaultClientValue {
+		t.Fatalf("headers = %v, want x-opencode-client=cli", resp.Headers)
 	}
+	if got := resp.Headers["X-Opencode-Session-Id"]; len(got) != 1 || got[0] != "codex-ses-1" {
+		t.Fatalf("headers = %v, want the session-id mirror", resp.Headers)
+	}
+	if got := resp.Headers["X-Opencode-Project"]; len(got) != 1 || got[0] != defaultProjectValue {
+		t.Fatalf("headers = %v, want x-opencode-project=global", resp.Headers)
+	}
+	mustMatchingRequestID(t, resp.Headers)
 }
 
 func TestUnderscoreVariantsMapped(t *testing.T) {
@@ -275,7 +311,7 @@ func TestRegister(t *testing.T) {
 	if reg.Metadata.Name != pluginID ||
 		reg.Metadata.Version != pluginVersion ||
 		reg.Metadata.Author != "ahoo" ||
-		reg.Metadata.GitHubRepository != "https://github.com/ahoo/cpa-plugin-opencode-session-mapper" {
+		reg.Metadata.GitHubRepository != "https://github.com/Lynn-Becky/cpa-plugin-opencode" {
 		t.Fatalf("metadata = %+v, want current release identity", reg.Metadata)
 	}
 }
@@ -398,5 +434,175 @@ func TestClaudeCodeUUIDSessionMappedBothMethods(t *testing.T) {
 		if len(got) != 1 || got[0] != sessionFixture {
 			t.Fatal("uuid-shaped session not mapped")
 		}
+	}
+}
+
+// regenerateRequestID derives one value per host request id so the
+// before-auth and after-auth interceptor passes agree on a single wire value,
+// and varies it across requests: a fixed id fails the free-tier fingerprint.
+func TestRequestIDDeterministicPerRequestAndVaried(t *testing.T) {
+	first, err := regenerateRequestID("host-request-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	again, err := regenerateRequestID("host-request-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first != again {
+		t.Fatalf("derived ids drifted: %q vs %q", first, again)
+	}
+	other, err := regenerateRequestID("host-request-2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if other == first {
+		t.Fatalf("distinct request ids shared %q", first)
+	}
+	if !requestIDPattern.MatchString(first) {
+		t.Fatalf("derived id %q does not match the official format", first)
+	}
+}
+
+// Without a host request id the value is generated fresh per call; two calls
+// must not share an id.
+func TestRequestIDRandomWithoutEnvelopeID(t *testing.T) {
+	first, err := regenerateRequestID("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := regenerateRequestID("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first == second {
+		t.Fatalf("random ids collided: %q", first)
+	}
+	if !requestIDPattern.MatchString(first) {
+		t.Fatalf("random id %q does not match the official format", first)
+	}
+}
+
+// The interceptor emits the request id per request: distinct host request ids
+// derive distinct values, and an absent host request id degrades to per-call
+// generation.
+func TestInterceptorRequestIDVariesPerRequest(t *testing.T) {
+	idFor := func(t *testing.T, requestID string) string {
+		t.Helper()
+		raw, err := json.Marshal(interceptRequest{RequestID: requestID, Headers: map[string][]string{"Session-Id": {"s"}}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		out, err := handleMethod("request.intercept_before", raw)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var env envelope
+		if err := json.Unmarshal(out, &env); err != nil {
+			t.Fatal(err)
+		}
+		if !env.OK {
+			t.Fatalf("envelope not ok: %s", out)
+		}
+		var resp interceptResponse
+		if err := json.Unmarshal(env.Result, &resp); err != nil {
+			t.Fatal(err)
+		}
+		return mustMatchingRequestID(t, resp.Headers)
+	}
+	first := idFor(t, "host-request-a")
+	second := idFor(t, "host-request-b")
+	if first == second {
+		t.Fatalf("distinct host request ids derived %q twice", first)
+	}
+	third := idFor(t, "")
+	fourth := idFor(t, "")
+	if third == fourth {
+		t.Fatalf("generated ids collided on %q", third)
+	}
+}
+
+// A client-supplied x-opencode-request passes through unchanged (never
+// replaced with a generated one), but a conflicting case-variant pair fails
+// closed instead of forwarding arbitrary garbage.
+func TestClientRequestHeaderPreservedAndConflictFailsClosed(t *testing.T) {
+	resp := mustIntercept(t, map[string][]string{
+		"Session-Id":         {"s1"},
+		"x-opencode-request": {"msg_fromclient00000000000"},
+	})
+	if got := resp.Headers["X-Opencode-Request"]; len(got) != 1 || got[0] != "msg_fromclient00000000000" {
+		t.Fatalf("headers = %v, want the client value preserved", resp.Headers)
+	}
+	if got := resp.Headers["X-Opencode-Session"]; len(got) != 1 || got[0] != "s1" {
+		t.Fatalf("headers = %v, want s1 mapped anyway", resp.Headers)
+	}
+	resp = mustIntercept(t, map[string][]string{
+		"Session-Id":         {"s1"},
+		"X-Opencode-Request": {"msg_aaaaaaaaaaaaaa"},
+		"x-opencode-request": {"msg_bbbbbbbbbbbbbbbbbbbb"},
+	})
+	if len(resp.Headers) != 0 {
+		t.Fatalf("headers = %v, want empty for conflicting request headers", resp.Headers)
+	}
+}
+
+// x-opencode-project mirrors the official CLI: injected as "global" when
+// absent, preserved when present, fail-closed on conflicting pairs.
+func TestProjectHeaderBehavior(t *testing.T) {
+	resp := mustIntercept(t, map[string][]string{"Session-Id": {"s1"}})
+	if got := resp.Headers["X-Opencode-Project"]; len(got) != 1 || got[0] != defaultProjectValue {
+		t.Fatalf("headers = %v, want global", resp.Headers)
+	}
+	resp = mustIntercept(t, map[string][]string{
+		"Session-Id":         {"s1"},
+		"x-opencode-project": {"personal"},
+	})
+	if got := resp.Headers["X-Opencode-Project"]; len(got) != 1 || got[0] != "personal" {
+		t.Fatalf("headers = %v, want the client value preserved", resp.Headers)
+	}
+	resp = mustIntercept(t, map[string][]string{
+		"Session-Id":         {"s1"},
+		"X-Opencode-Project": {"a"},
+		"x-opencode-project": {"b"},
+	})
+	if len(resp.Headers) != 0 {
+		t.Fatalf("headers = %v, want empty for conflicting project headers", resp.Headers)
+	}
+}
+
+// The session-id mirror: injected beside a mapped session, preserved when the
+// client sent its own, fail-closed when the client's values conflict.
+func TestSessionIDMirrorBehavior(t *testing.T) {
+	resp := mustIntercept(t, map[string][]string{"Session-Id": {"s1"}})
+	if got := resp.Headers["X-Opencode-Session-Id"]; len(got) != 1 || got[0] != "s1" {
+		t.Fatalf("headers = %v, want the s1 mirror", resp.Headers)
+	}
+	resp = mustIntercept(t, map[string][]string{
+		"Session-Id":            {"s1"},
+		"X-Opencode-Session-Id": {"client-own"},
+	})
+	if got := resp.Headers["X-Opencode-Session-Id"]; len(got) != 1 || got[0] != "client-own" {
+		t.Fatalf("headers = %v, want the client value preserved", resp.Headers)
+	}
+	resp = mustIntercept(t, map[string][]string{
+		"Session-Id":            {"s1"},
+		"X-Opencode-Session-Id": {"a"},
+		"x-opencode-session-id": {"b"},
+	})
+	if len(resp.Headers) != 0 {
+		t.Fatalf("headers = %v, want empty for conflicting session-id headers", resp.Headers)
+	}
+}
+
+// A conflicting x-opencode-session presented directly by the client (poisoned
+// authoritative source) still fails closed as a whole.
+func TestPoisonedAuthoritativeSessionFailsClosed(t *testing.T) {
+	resp := mustIntercept(t, map[string][]string{
+		"X-Opencode-Session":    {"a"},
+		"x-opencode-session-id": {"b"},
+		"x-opencode-session":    {"c"},
+	})
+	if len(resp.Headers) != 0 {
+		t.Fatalf("headers = %v, want empty", resp.Headers)
 	}
 }

@@ -12,6 +12,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -19,22 +20,29 @@ import (
 
 const (
 	pluginID          = "opencode-session-mapper"
-	pluginRepository  = "https://github.com/ahoo/cpa-plugin-opencode-session-mapper"
+	pluginRepository  = "https://github.com/Lynn-Becky/cpa-plugin-opencode"
 	requestBodyBytes  = 6_378_698
 	maxReadBytes      = 8 << 20
 	syntheticMarker   = "mapper-large-envelope-marker-q7z"
 	syntheticSession  = "123e4567-e89b-12d3-a456-426614174000"
-	expectedClient    = "cliproxy"
+	expectedClient    = "cli"
+	expectedProject   = "global"
 	expectedModel     = "mock-model"
 	managementPath    = "/v0/management/plugins"
 	mockReportPath    = "/__mapper_report"
 	expectedHostBuild = "2026-09-15T14:07:07Z"
 )
 
+// Official CLI free-tier wire fingerprint: msg_ + 12 hex + 14 base62.
+var requestIDPattern = regexp.MustCompile(`^msg_[0-9a-f]{12}[A-Za-z0-9]{14}$`)
+
 type mockReport struct {
 	Requests           int    `json:"requests"`
 	SessionHeaderExact bool   `json:"session_header_exact"`
+	SessionIDExact     bool   `json:"session_id_exact"`
+	RequestFormat      bool   `json:"request_format"`
 	ClientHeaderExact  bool   `json:"client_header_exact"`
+	ProjectHeaderExact bool   `json:"project_header_exact"`
 	PathExact          bool   `json:"path_exact"`
 	BodyValid          bool   `json:"body_valid"`
 	BodyBytes          int    `json:"body_bytes"`
@@ -86,7 +94,10 @@ type reportPlugin struct {
 type phaseAssertions struct {
 	LargeEnvelopeForwarded bool `json:"large_envelope_forwarded"`
 	SessionHeaderMapped    bool `json:"session_header_mapped"`
+	SessionIDHeaderMapped  bool `json:"session_id_header_mapped"`
+	RequestHeaderFormatted bool `json:"request_header_formatted"`
 	ClientHeaderMapped     bool `json:"client_header_mapped"`
+	ProjectHeaderMapped    bool `json:"project_header_mapped"`
 	MockRequestCountOne    bool `json:"mock_request_count_one"`
 }
 
@@ -182,7 +193,10 @@ func runMock(listen string) error {
 		state.mu.Lock()
 		state.report.Requests++
 		state.report.SessionHeaderExact = len(r.Header.Values("X-Opencode-Session")) == 1 && r.Header.Get("X-Opencode-Session") == syntheticSession
+		state.report.SessionIDExact = len(r.Header.Values("X-Opencode-Session-Id")) == 1 && r.Header.Get("X-Opencode-Session-Id") == syntheticSession
+		state.report.RequestFormat = len(r.Header.Values("X-Opencode-Request")) == 1 && requestIDPattern.MatchString(strings.TrimSpace(r.Header.Get("X-Opencode-Request")))
 		state.report.ClientHeaderExact = len(r.Header.Values("X-Opencode-Client")) == 1 && r.Header.Get("X-Opencode-Client") == expectedClient
+		state.report.ProjectHeaderExact = len(r.Header.Values("X-Opencode-Project")) == 1 && r.Header.Get("X-Opencode-Project") == expectedProject
 		state.report.PathExact = r.URL.Path == "/v1/chat/completions"
 		state.report.BodyValid = json.Valid(body)
 		state.report.BodyBytes = len(body)
@@ -248,11 +262,16 @@ func runVerify(opts verifyOptions) error {
 	assertions := phaseAssertions{
 		LargeEnvelopeForwarded: mock.BodyBytes == requestBodyBytes && mock.BodySHA256 == expectedDigest && mock.BodyValid && mock.PathExact,
 		SessionHeaderMapped:    mock.SessionHeaderExact,
+		SessionIDHeaderMapped:  mock.SessionIDExact,
+		RequestHeaderFormatted: mock.RequestFormat,
 		ClientHeaderMapped:     mock.ClientHeaderExact,
+		ProjectHeaderMapped:    mock.ProjectHeaderExact,
 		MockRequestCountOne:    mock.Requests == 1,
 	}
 	if !assertions.LargeEnvelopeForwarded || !assertions.SessionHeaderMapped ||
-		!assertions.ClientHeaderMapped || !assertions.MockRequestCountOne {
+		!assertions.SessionIDHeaderMapped || !assertions.RequestHeaderFormatted ||
+		!assertions.ClientHeaderMapped || !assertions.ProjectHeaderMapped ||
+		!assertions.MockRequestCountOne {
 		return errors.New("mock boundary assertions failed")
 	}
 	report := phaseReport{

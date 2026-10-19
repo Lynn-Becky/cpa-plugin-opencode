@@ -145,7 +145,10 @@ openai-compatibility:
       - api-key: "mapper-harness-upstream"
     headers:
       X-Opencode-Session: $X-Opencode-Session
+      X-Opencode-Session-Id: $X-Opencode-Session-Id
+      X-Opencode-Request: $X-Opencode-Request
       X-Opencode-Client: $X-Opencode-Client
+      X-Opencode-Project: $X-Opencode-Project
     models:
       - name: "mock-model"
         alias: "mock-model"
@@ -273,7 +276,10 @@ if set(phase) != expected_top or phase.get("schema_version") != 1:
 expected_phase_assertions = {
     "large_envelope_forwarded",
     "session_header_mapped",
+    "session_id_header_mapped",
+    "request_header_formatted",
     "client_header_mapped",
+    "project_header_mapped",
     "mock_request_count_one",
 }
 assertions = phase.get("assertions")
